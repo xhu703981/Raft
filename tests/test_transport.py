@@ -16,7 +16,8 @@ def test_frame_roundtrip():
     a, b = socket.socketpair()
     with a, b:
         send_msg(a, {"type": "x", "n": 1})
-        send_msg(a, {"big": "y" * 1_000_000})
+        # 1 MB exceeds the socket buffer on Linux, so send it while we read.
+        threading.Thread(target=send_msg, args=(a, {"big": "y" * 1_000_000})).start()
         assert recv_msg(b) == {"type": "x", "n": 1}
         assert len(recv_msg(b)["big"]) == 1_000_000
 
