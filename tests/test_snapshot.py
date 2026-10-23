@@ -68,7 +68,7 @@ def follower_with_log(*terms: int) -> RaftCore:
 
 def snapshot_msg(index: int, snap_term: int) -> dict:
     return {"type": "snapshot", "src": 2, "dst": 1, "term": 3, "index": index,
-            "snap_term": snap_term, "data": {"k": "v"}}  # fmt: skip
+            "snap_term": snap_term, "data": {"k": "v"}, "seq": 4}  # fmt: skip
 
 
 def test_install_snapshot_keeps_matching_suffix():
@@ -87,4 +87,4 @@ def test_install_snapshot_discards_conflicting_log():
     ready = core.take_ready()
     assert ready.writes[-1]["op"] == "compact"
     assert ready.messages[-1] == {"type": "append_reply", "term": 3, "src": 1, "dst": 2,
-                                  "success": True, "match": 3}  # fmt: skip
+                                  "success": True, "match": 3, "seq": 4}  # fmt: skip

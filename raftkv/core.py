@@ -28,6 +28,8 @@ class Ready:
     messages: list[Message]
     # Once `writes` are durable, the log is durable up to this (index, term).
     mark: tuple[int, int] | None
+    # Finished read-index requests: (read_id, index to wait for), or None if leadership was lost.
+    reads: list[tuple[int, int | None]]
 
 
 class RaftCore:
@@ -59,6 +61,12 @@ class RaftCore:
         self.next_index: dict[int, int] = {}
         self.match_index: dict[int, int] = {}
         self.inflight: dict[int, bool] = {}
+        # Read-index: every AppendEntries carries `seq`; a reply proves the peer
+        # still followed us when that seq was sent.
+        self.seq = 0
+        self.acked_seq: dict[int, int] = {}
+        self.pending_reads: list[tuple[int, int, int]] = []  # (read_id, index, seq)
+        self.read_results: list[tuple[int, int | None]] = []
         self.writes: list[Record] = []
         self.messages: list[Message] = []
         self.election_deadline = 0.0
@@ -97,6 +105,18 @@ class RaftCore:
                 self.send_append(peer)
         return index
 
+    def read_index(self, read_id: int) -> bool:
+        """Start a linearizable read; its result arrives later in Ready.reads."""
+        # Until our no-op commits, commit_index may lag what earlier leaders committed.
+        if self.role != LEADER or self.log.term_at(self.commit_index) != self.term:
+            return False
+        self.seq += 1
+        self.pending_reads.append((read_id, self.commit_index, self.seq))
+        for peer in self.peers:
+            self.send_append(peer)
+        self.check_reads()
+        return True
+
     def compact(self, index: int, data: Any) -> None:
         """Replace the log up to `index` (already applied) with a state machine snapshot."""
         term = self.log.term_at(index)
@@ -116,8 +136,8 @@ class RaftCore:
 
     def take_ready(self) -> Ready:
         mark = (self.log.last_index, self.log.last_term) if self.writes else None
-        ready = Ready(self.writes, self.messages, mark)
-        self.writes, self.messages = [], []
+        ready = Ready(self.writes, self.messages, mark, self.read_results)
+        self.writes, self.messages, self.read_results = [], [], []
         return ready
 
     def take_committed(self) -> tuple[Record | None, list[tuple[int, Entry]]]:
@@ -172,6 +192,8 @@ class RaftCore:
             self.leader_id = None
             self.persist_meta()
         self.role = FOLLOWER
+        self.read_results += [(read_id, None) for read_id, _, _ in self.pending_reads]
+        self.pending_reads = []
 
     def become_leader(self, now: float) -> None:
         self.role = LEADER
@@ -179,6 +201,7 @@ class RaftCore:
         self.next_index = {p: self.log.last_index + 1 for p in self.peers}
         self.match_index = {p: 0 for p in self.peers}
         self.inflight = {p: False for p in self.peers}
+        self.acked_seq = {p: 0 for p in self.peers}
         # A no-op from the new term lets earlier entries commit (paper 5.4.2).
         self.persist_entries(self.log.append(Entry(self.term, None)))
         self.broadcast_append(now)
@@ -198,7 +221,12 @@ class RaftCore:
             snap = self.snapshot
             assert snap is not None
             self.send(
-                peer, "snapshot", index=snap["index"], snap_term=snap["term"], data=snap["data"]
+                peer,
+                "snapshot",
+                index=snap["index"],
+                snap_term=snap["term"],
+                data=snap["data"],
+                seq=self.seq,
             )
             return
         self.send(
@@ -208,11 +236,12 @@ class RaftCore:
             prev_term=self.log.term_at(prev),
             entries=self.log.slice(prev + 1, MAX_BATCH),
             commit=self.commit_index,
+            seq=self.seq,
         )
 
     def on_append(self, msg: Message, now: float) -> None:
         if msg["term"] < self.term:
-            self.send(msg["src"], "append_reply", success=False, match=0)
+            self.reply(msg, success=False, match=0)
             return
         # Same term: a candidate that hears from the winner steps down.
         self.become_follower(msg["term"])
@@ -224,7 +253,7 @@ class RaftCore:
         if prev >= self.log.base_index and self.log.term_at(prev) != msg["prev_term"]:
             # Tell the leader where to retry: right before the mismatch.
             hint = min(prev - 1, self.log.last_index)
-            self.send(msg["src"], "append_reply", success=False, match=hint)
+            self.reply(msg, success=False, match=hint)
             return
         entries = [Entry(*e) for e in msg["entries"]]
         changed = self.log.merge(prev, entries)
@@ -233,11 +262,11 @@ class RaftCore:
         match = prev + len(entries)
         # Only up to `match`: entries past it may still be stale leftovers.
         self.commit_index = max(self.commit_index, min(msg["commit"], match))
-        self.send(msg["src"], "append_reply", success=True, match=match)
+        self.reply(msg, success=True, match=match)
 
     def on_snapshot(self, msg: Message, now: float) -> None:
         if msg["term"] < self.term:
-            self.send(msg["src"], "append_reply", success=False, match=0)
+            self.reply(msg, success=False, match=0)
             return
         self.become_follower(msg["term"])
         self.leader_id = msg["src"]
@@ -253,13 +282,15 @@ class RaftCore:
             self.pending_restore = self.snapshot
             self.commit_index = self.applied_index = index
             self.persist_snapshot()
-        self.send(msg["src"], "append_reply", success=True, match=index)
+        self.reply(msg, success=True, match=index)
 
     def on_append_reply(self, msg: Message, now: float) -> None:
         if self.role != LEADER or msg["term"] != self.term:
             return
         peer = msg["src"]
         self.inflight[peer] = False
+        self.acked_seq[peer] = max(self.acked_seq[peer], msg["seq"])
+        self.check_reads()
         if msg["success"]:
             self.match_index[peer] = max(self.match_index[peer], msg["match"])
             self.next_index[peer] = self.match_index[peer] + 1
@@ -283,12 +314,24 @@ class RaftCore:
                 self.commit_index = index
                 return
 
+    def check_reads(self) -> None:
+        while self.pending_reads:
+            read_id, index, seq = self.pending_reads[0]
+            acks = 1 + sum(self.acked_seq[p] >= seq for p in self.peers)
+            if acks < self.majority:
+                return
+            self.read_results.append((read_id, index))
+            self.pending_reads.pop(0)
+
     # ---- helpers ------------------------------------------------------------
 
     def send(self, dst: int, kind: str, **fields: Any) -> None:
         self.messages.append(
             {"type": kind, "term": self.term, "src": self.id, "dst": dst, **fields}
         )
+
+    def reply(self, msg: Message, success: bool, match: int) -> None:
+        self.send(msg["src"], "append_reply", success=success, match=match, seq=msg["seq"])
 
     def persist_meta(self) -> None:
         self.writes.append({"op": "meta", "term": self.term, "vote": self.voted_for})

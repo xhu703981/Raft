@@ -35,6 +35,7 @@ class SimCluster:
         # Every entry any node has ever seen committed, by index.
         self.committed: dict[int, Entry] = {}
         self.applied: dict[int, list[tuple[int, object]]] = {}
+        self.reads: dict[int, int | None] = {}
         for i in self.ids:
             self.start(i)
 
@@ -112,6 +113,7 @@ class SimCluster:
         node = self.nodes[i]
         self._check(node)
         ready = node.take_ready()
+        self.reads.update(ready.reads)
         if ready.writes or ready.messages:
             queue = self.disk_queue[i]
             due = self.now + self.rng.randint(*self.disk_delay)

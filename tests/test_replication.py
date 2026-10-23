@@ -53,7 +53,7 @@ def test_uncommitted_entries_of_isolated_leader_are_replaced():
 
 def append_reply(src: int, term: int, match: int) -> dict:
     return {"type": "append_reply", "src": src, "dst": 1, "term": term,
-            "success": True, "match": match}  # fmt: skip
+            "success": True, "match": match, "seq": 0}  # fmt: skip
 
 
 def leader_with_log(*terms: int) -> RaftCore:
@@ -92,7 +92,7 @@ def test_follower_commit_is_capped_by_verified_prefix():
         log.append(Entry(t, "stale"))
     core = RaftCore(1, [2, 3], PersistentState(term=1, log=log), 0, random.Random(0))
     msg = {"type": "append", "src": 2, "dst": 1, "term": 1, "prev_index": 0, "prev_term": 0,
-           "entries": [[1, "stale"]], "commit": 3}  # fmt: skip
+           "entries": [[1, "stale"]], "commit": 3, "seq": 0}  # fmt: skip
     core.step(msg, now=0)
     # Only index 1 is known to match the leader, so only it may commit.
     assert core.commit_index == 1
@@ -101,7 +101,7 @@ def test_follower_commit_is_capped_by_verified_prefix():
 def test_mismatch_reply_hints_retry_point():
     core = RaftCore(1, [2, 3], PersistentState(term=1), 0, random.Random(0))
     msg = {"type": "append", "src": 2, "dst": 1, "term": 1, "prev_index": 7, "prev_term": 1,
-           "entries": [], "commit": 0}  # fmt: skip
+           "entries": [], "commit": 0, "seq": 0}  # fmt: skip
     core.step(msg, now=0)
     reply = core.take_ready().messages[0]
     assert reply["success"] is False
