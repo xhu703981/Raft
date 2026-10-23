@@ -10,6 +10,7 @@ import heapq
 import random
 
 from raftkv.core import LEADER, RaftCore, Ready
+from raftkv.log import Entry
 from raftkv.storage import Record, replay
 
 TICK_MS = 10
@@ -30,6 +31,9 @@ class SimCluster:
         self.disk_delay = (0, 2)
         self.drop_rate = 0.0
         self.leaders_by_term: dict[int, int] = {}
+        # Every entry any node has ever seen committed, by index.
+        self.committed: dict[int, Entry] = {}
+        self.applied: dict[int, list[tuple[int, object]]] = {}
         for i in self.ids:
             self.start(i)
 
@@ -39,6 +43,7 @@ class SimCluster:
         peers = [p for p in self.ids if p != i]
         state = replay(self.disks[i])
         self.nodes[i] = RaftCore(i, peers, state, self.now, random.Random(self.rng.random()))
+        self.applied[i] = []
 
     def crash(self, i: int) -> None:
         self.nodes[i] = None
@@ -73,6 +78,18 @@ class SimCluster:
             self.run(1)
         return predicate()
 
+    def propose(self, command: object) -> int | None:
+        leader = self.leader()
+        if leader is None:
+            return None
+        index = leader.propose(command)
+        self._collect(leader.id)
+        return index
+
+    def commands(self, i: int) -> list[object]:
+        """Client commands node i has applied, in order (no-ops left out)."""
+        return [c for _, c in self.applied[i] if c is not None]
+
     def leader(self) -> RaftCore | None:
         live = [n for n in self.nodes.values() if n and n.role == LEADER]
         return max(live, key=lambda n: n.term) if live else None
@@ -106,6 +123,9 @@ class SimCluster:
             while queue and queue[0][0] <= self.now:
                 ready = queue.pop(0)[1]
                 self._persist(i, ready.writes)
+                if ready.mark:
+                    self.nodes[i].persisted(*ready.mark)
+                    self._collect(i)
                 for msg in ready.messages:
                     if self.rng.random() >= self.drop_rate:
                         self.msg_seq += 1
@@ -120,6 +140,18 @@ class SimCluster:
                 self.disks[i].append(record)
 
     def _check(self, node: RaftCore) -> None:
-        if node.role == LEADER:
-            winner = self.leaders_by_term.setdefault(node.term, node.id)
-            assert winner == node.id, f"two leaders in term {node.term}"
+        if node.role == LEADER and node.term not in self.leaders_by_term:
+            self.leaders_by_term[node.term] = node.id
+            self._check_leader_completeness(node)
+        winner = self.leaders_by_term.get(node.term)
+        assert node.role != LEADER or winner == node.id, f"two leaders in term {node.term}"
+        for index, entry in node.take_committed():
+            seen = self.committed.setdefault(index, entry)
+            assert seen == entry, f"index {index} committed as {seen} and {entry}"
+            self.applied[node.id].append((index, entry.command))
+
+    def _check_leader_completeness(self, node: RaftCore) -> None:
+        for index, entry in self.committed.items():
+            if index > node.log.base_index:
+                assert node.log.term_at(index) == entry.term, f"new leader lost {index}"
+                assert node.log.get(index) == entry

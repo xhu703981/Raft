@@ -83,6 +83,10 @@ class Node:
             self.storage.submit(ready.writes, lambda: self._on_durable(ready))
 
     def _on_durable(self, ready: Ready) -> None:
+        if ready.mark:
+            with self.lock:
+                self.core.persisted(*ready.mark)
+                self._flush()
         for msg in ready.messages:
             self.peers[msg["dst"]].send(msg)
 
