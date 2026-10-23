@@ -46,6 +46,9 @@ class RaftCore:
         self.term = state.term
         self.voted_for = state.vote
         self.log = state.log
+        self.snapshot = state.snapshot
+        # A snapshot received from the leader, waiting to be loaded into the state machine.
+        self.pending_restore: Record | None = None
         self.role = FOLLOWER
         self.leader_id: int | None = None
         self.votes: set[int] = set()
@@ -79,6 +82,7 @@ class RaftCore:
             "vote_reply": self.on_vote_reply,
             "append": self.on_append,
             "append_reply": self.on_append_reply,
+            "snapshot": self.on_snapshot,
         }
         handlers[msg["type"]](msg, now)
 
@@ -92,6 +96,13 @@ class RaftCore:
             if not self.inflight[peer]:
                 self.send_append(peer)
         return index
+
+    def compact(self, index: int, data: Any) -> None:
+        """Replace the log up to `index` (already applied) with a state machine snapshot."""
+        term = self.log.term_at(index)
+        self.snapshot = {"op": "snapshot", "index": index, "term": term, "data": data}
+        self.log.compact(index)
+        self.persist_snapshot()
 
     def persisted(self, index: int, term: int) -> None:
         """The WAL has fsynced the log up to (index, term)."""
@@ -109,12 +120,13 @@ class RaftCore:
         self.writes, self.messages = [], []
         return ready
 
-    def take_committed(self) -> list[tuple[int, Entry]]:
-        """Committed entries not yet handed to the state machine."""
+    def take_committed(self) -> tuple[Record | None, list[tuple[int, Entry]]]:
+        """A snapshot to restore (if any), then committed entries not yet applied."""
+        restore, self.pending_restore = self.pending_restore, None
         start = self.applied_index + 1
         entries = self.log.slice(start, self.commit_index - self.applied_index)
         self.applied_index = self.commit_index
-        return list(enumerate(entries, start))
+        return restore, list(enumerate(entries, start))
 
     # ---- elections ----------------------------------------------------------
 
@@ -181,6 +193,14 @@ class RaftCore:
     def send_append(self, peer: int) -> None:
         prev = self.next_index[peer] - 1
         self.inflight[peer] = True
+        if prev < self.log.base_index:
+            # The entries this peer needs are gone; ship the snapshot instead.
+            snap = self.snapshot
+            assert snap is not None
+            self.send(
+                peer, "snapshot", index=snap["index"], snap_term=snap["term"], data=snap["data"]
+            )
+            return
         self.send(
             peer,
             "append",
@@ -200,7 +220,8 @@ class RaftCore:
         self.reset_election_timer(now)
 
         prev = msg["prev_index"]
-        if self.log.term_at(prev) != msg["prev_term"]:
+        # Below our snapshot everything is committed, hence consistent with the leader.
+        if prev >= self.log.base_index and self.log.term_at(prev) != msg["prev_term"]:
             # Tell the leader where to retry: right before the mismatch.
             hint = min(prev - 1, self.log.last_index)
             self.send(msg["src"], "append_reply", success=False, match=hint)
@@ -213,6 +234,26 @@ class RaftCore:
         # Only up to `match`: entries past it may still be stale leftovers.
         self.commit_index = max(self.commit_index, min(msg["commit"], match))
         self.send(msg["src"], "append_reply", success=True, match=match)
+
+    def on_snapshot(self, msg: Message, now: float) -> None:
+        if msg["term"] < self.term:
+            self.send(msg["src"], "append_reply", success=False, match=0)
+            return
+        self.become_follower(msg["term"])
+        self.leader_id = msg["src"]
+        self.reset_election_timer(now)
+        index, term = msg["index"], msg["snap_term"]
+        if index > self.commit_index:
+            # Keep our suffix only if it continues the snapshot (paper section 7).
+            if self.log.term_at(index) == term:
+                self.log.compact(index)
+            else:
+                self.log.reset(index, term)
+            self.snapshot = {"op": "snapshot", "index": index, "term": term, "data": msg["data"]}
+            self.pending_restore = self.snapshot
+            self.commit_index = self.applied_index = index
+            self.persist_snapshot()
+        self.send(msg["src"], "append_reply", success=True, match=index)
 
     def on_append_reply(self, msg: Message, now: float) -> None:
         if self.role != LEADER or msg["term"] != self.term:
@@ -257,3 +298,12 @@ class RaftCore:
         entries = self.log.slice(index, self.log.last_index)
         self.writes.append({"op": "entries", "index": index, "entries": entries})
         self.durable_index = min(self.durable_index, index - 1)
+
+    def persist_snapshot(self) -> None:
+        """Rewrite the WAL as: snapshot, term/vote, remaining entries."""
+        meta = {"op": "meta", "term": self.term, "vote": self.voted_for}
+        start = self.log.base_index + 1
+        rest = self.log.slice(start, len(self.log.entries))
+        entries = {"op": "entries", "index": start, "entries": rest}
+        self.writes.append({"op": "compact", "records": [self.snapshot, meta, entries]})
+        self.durable_index = min(self.durable_index, self.log.last_index)

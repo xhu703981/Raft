@@ -18,7 +18,7 @@ from raftkv.core import RaftCore, Ready
 from raftkv.storage import Storage
 from raftkv.transport import Address, Message, Peer, Server
 
-RAFT_MESSAGES = {"vote", "vote_reply", "append", "append_reply"}
+RAFT_MESSAGES = {"vote", "vote_reply", "append", "append_reply", "snapshot"}
 TICK_SECONDS = 0.01
 
 log = logging.getLogger(__name__)

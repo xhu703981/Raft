@@ -30,6 +30,7 @@ class SimCluster:
         self.net_delay = (1, 5)
         self.disk_delay = (0, 2)
         self.drop_rate = 0.0
+        self.snapshot_every: int | None = None  # compact once the log has this many entries
         self.leaders_by_term: dict[int, int] = {}
         # Every entry any node has ever seen committed, by index.
         self.committed: dict[int, Entry] = {}
@@ -43,7 +44,7 @@ class SimCluster:
         peers = [p for p in self.ids if p != i]
         state = replay(self.disks[i])
         self.nodes[i] = RaftCore(i, peers, state, self.now, random.Random(self.rng.random()))
-        self.applied[i] = []
+        self.applied[i] = list(state.snapshot["data"]) if state.snapshot else []
 
     def crash(self, i: int) -> None:
         self.nodes[i] = None
@@ -145,10 +146,19 @@ class SimCluster:
             self._check_leader_completeness(node)
         winner = self.leaders_by_term.get(node.term)
         assert node.role != LEADER or winner == node.id, f"two leaders in term {node.term}"
-        for index, entry in node.take_committed():
+        restore, entries = node.take_committed()
+        if restore:
+            # Snapshot data in the simulation is the applied (index, command) list itself.
+            self.applied[node.id] = list(restore["data"])
+            for index, command in restore["data"]:
+                assert self.committed[index].command == command, f"bad snapshot at {index}"
+        for index, entry in entries:
             seen = self.committed.setdefault(index, entry)
             assert seen == entry, f"index {index} committed as {seen} and {entry}"
             self.applied[node.id].append((index, entry.command))
+        if self.snapshot_every and len(node.log.entries) >= self.snapshot_every:
+            if node.applied_index > node.log.base_index:
+                node.compact(node.applied_index, list(self.applied[node.id]))
 
     def _check_leader_completeness(self, node: RaftCore) -> None:
         for index, entry in self.committed.items():
