@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install pytest ruff
+      - run: ruff check .
+      - run: ruff format --check .
+      - name: pytest
+        run: timeout 300 pytest -q --durations=5
+      - name: fault-injection time budget
+        run: timeout 60 pytest -q tests/test_fault_injection.py

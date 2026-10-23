@@ -119,6 +119,7 @@ class Node:
             core = self.core
             return {
                 "id": core.id,
+                "pid": os.getpid(),
                 "role": core.role,
                 "term": core.term,
                 "leader": core.leader_id,
