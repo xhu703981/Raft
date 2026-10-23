@@ -165,8 +165,9 @@ Leader failover over 10 kills (the leader process is killed outright):
 | until the first write is accepted | 446 ms | 297 ms | 829 ms |
 
 Notes:
-- Results vary by about 25% between runs. An earlier run gave 4315 writes/s at
-  64 clients, with a 234 ms median election time.
+- These numbers come from one of three full runs. Across all three, 64-client
+  throughput was 3292-4315 writes/s. The median election time was 234-438 ms,
+  and the worst single failover took 1234 ms (several split votes in a row).
 - Group commit works: at 64 clients, one fsync covers about 8.5 writes.
 - Failover time is mostly the election timeout. A follower waits 150-300 ms
   without heartbeats before standing for election, and split votes (when two
