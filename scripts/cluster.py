@@ -21,8 +21,8 @@ def main() -> None:
 
     cluster = local_cluster(args.size, args.base_port)
     procs = [start_node(i, cluster, args.data) for i in cluster]
-    print(f"nodes: {cluster}")
-    print(f"leader: node {wait_for_leader(cluster)}")
+    print(f"nodes: {cluster}", flush=True)
+    print(f"leader: node {wait_for_leader(cluster)}", flush=True)
     try:
         for proc in procs:
             proc.join()
